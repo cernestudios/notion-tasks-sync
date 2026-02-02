@@ -187,6 +187,18 @@ To see workflow output:
 
 ---
 
+## Troubleshooting
+
+### "All jobs were cancelled" / "Job was not acquired by Runner" / "Internal server error"
+
+These messages usually come from **GitHub Actions**, not from this repo:
+
+- **All jobs were cancelled** – A new run (e.g. hourly) was in the same concurrency group as a run that was still in progress. The workflow is now set so new runs **queue** instead of cancelling in-progress runs.
+- **Job was not acquired by Runner of type hosted** – GitHub’s hosted runners were temporarily unavailable. **Fix:** Re-run the workflow from the Actions tab (Re-run all jobs), or wait for the next scheduled run.
+- **Internal server error** (with Correlation ID) – Transient GitHub backend issue. **Fix:** Re-run the workflow; it often succeeds on the next run.
+
+---
+
 ## Future Roadmap
 
 - Automatic updates when Notion entries change

@@ -10,8 +10,9 @@ jobs:
   sync-second:
     runs-on: ubuntu-latest
     concurrency:
+      # One run at a time; new runs queue instead of cancelling in-progress
       group: notion-gcal-sync-2
-      cancel-in-progress: true
+      cancel-in-progress: false
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
