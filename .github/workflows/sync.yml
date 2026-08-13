@@ -3,8 +3,8 @@ name: Notion-Calendar Sync (Tasks)
 on:
   workflow_dispatch: {}
   schedule:
-    # Runs every hour (cron is UTC)
-    - cron: "0 * * * *"
+    # Runs every 15 mins (cron is UTC)
+    - cron: "*/15 * * * *"
 
 jobs:
   sync:
