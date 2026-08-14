@@ -7,7 +7,7 @@ Works with all types of Notion date properties:
 - Events with a start time only (creates 0-duration events in Google Calendar)
 - Events with start and end times
 
----
+----
 
 ## Features
 - Runs automatically every hour via **GitHub Actions**
