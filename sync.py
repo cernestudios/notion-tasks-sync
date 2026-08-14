@@ -15,18 +15,57 @@ CALENDAR_ID = os.getenv('CALENDAR_ID', 'primary')
 NOTION_TITLE_PROPERTY = os.getenv('NOTION_TITLE_PROPERTY', 'Name')
 NOTION_DATE_PROPERTY = os.getenv('NOTION_DATE_PROPERTY', 'Date')
 
+# Titles that must NEVER be written back into Notion (data-loss guard)
+BLANK_TITLE_SENTINELS = {'', 'untitled event', 'untitled'}
+
+
+def title_is_blank(title):
+    """A title is 'blank' if it is empty, whitespace, or a placeholder like
+    'Untitled Event'. Such titles must never overwrite a real Notion title."""
+    if title is None:
+        return True
+    return title.strip().lower() in BLANK_TITLE_SENTINELS
+
 
 def parse_iso_datetime(value):
     """Parse ISO/RFC3339 timestamps from Notion/Google into aware datetimes."""
     if not value:
         return None
     try:
-        # Handle trailing 'Z' as UTC
         if isinstance(value, str) and value.endswith('Z'):
             value = value[:-1] + '+00:00'
         return datetime.fromisoformat(value)
     except Exception:
         return None
+
+
+def _norm_date_value(value):
+    """Normalize a date/datetime string for comparison.
+    Returns ('date', 'YYYY-MM-DD') for all-day, ('datetime', aware_dt) for timed,
+    ('raw', value) if unparseable, or (None, None) if empty."""
+    if not value:
+        return (None, None)
+    if isinstance(value, str) and len(value) == 10:
+        return ('date', value)
+    dt = parse_iso_datetime(value)
+    if dt is None:
+        return ('raw', value)
+    return ('datetime', dt)
+
+
+def date_values_equal(a, b):
+    """Compare two date/datetime values as instants (ignores sub-second and
+    timezone-format differences) so we don't detect fake changes every run."""
+    ta, va = _norm_date_value(a)
+    tb, vb = _norm_date_value(b)
+    if ta != tb:
+        return False
+    if ta == 'datetime':
+        try:
+            return abs((va - vb).total_seconds()) < 1
+        except Exception:
+            return va == vb
+    return va == vb
 
 
 def validate_env():
@@ -78,7 +117,6 @@ def get_notion_items():
 
     while True:
         page_count += 1
-        # Build request body with pagination cursor if available
         request_body = {}
         if next_cursor:
             request_body['start_cursor'] = next_cursor
@@ -92,7 +130,6 @@ def get_notion_items():
         if response.status_code != 200:
             print(f"❌ Error fetching Notion data: {response.status_code}")
             print(response.text)
-            # Return what we have so far, or empty list if first page failed
             if page_count == 1:
                 return []
             break
@@ -101,7 +138,6 @@ def get_notion_items():
         page_items = data.get('results', [])
         all_items.extend(page_items)
 
-        # Check if there are more pages
         has_more = data.get('has_more', False)
         next_cursor = data.get('next_cursor')
 
@@ -112,33 +148,37 @@ def get_notion_items():
 
     if page_count > 1:
         print(f"📚 Pagination complete: fetched {page_count} pages, {len(all_items)} total items")
-    
+
     return all_items
 
 
 def update_notion_page(page_id, title, start_date, end_date=None):
-    """Update a Notion page with new title and date"""
+    """Update a Notion page's date, and its title ONLY if a real (non-blank)
+    title is given. This is the core data-loss guard: a blank/'Untitled' title
+    is never written back into Notion."""
     headers = {
         'Authorization': f'Bearer {NOTION_TOKEN}',
         'Notion-Version': '2022-06-28',
         'Content-Type': 'application/json'
     }
 
-    # Build the date property
     date_property = {'start': start_date}
     if end_date and end_date != start_date:
         date_property['end'] = end_date
 
-    data = {
-        'properties': {
-            NOTION_TITLE_PROPERTY: {
-                'title': [{'text': {'content': title}}]
-            },
-            NOTION_DATE_PROPERTY: {
-                'date': date_property
-            }
+    properties = {
+        NOTION_DATE_PROPERTY: {
+            'date': date_property
         }
     }
+
+    # GUARD: only write the title when it is real and non-blank.
+    if not title_is_blank(title):
+        properties[NOTION_TITLE_PROPERTY] = {
+            'title': [{'text': {'content': title}}]
+        }
+
+    data = {'properties': properties}
 
     response = requests.patch(
         f'https://api.notion.com/v1/pages/{page_id}',
@@ -156,7 +196,6 @@ def create_notion_page(title, start_date, end_date=None, gcal_event_id=None):
         'Content-Type': 'application/json'
     }
 
-    # Build the date property
     date_property = {'start': start_date}
     if end_date and end_date != start_date:
         date_property['end'] = end_date
@@ -210,7 +249,6 @@ def gcal_event_to_notion_date(gcal_event):
     if 'date' in start:
         start_date = start['date']
         end_date = end.get('date')
-        # Google Calendar end dates are exclusive, so subtract 1 day
         if end_date:
             end_dt = datetime.strptime(end_date, "%Y-%m-%d") - timedelta(days=1)
             end_date = end_dt.strftime("%Y-%m-%d")
@@ -230,28 +268,27 @@ def gcal_event_to_notion_date(gcal_event):
 def notion_item_to_date(notion_item):
     """Extract date values from a Notion item"""
     properties = notion_item.get('properties', {})
-    
+
     if NOTION_DATE_PROPERTY in properties:
         date_prop = properties[NOTION_DATE_PROPERTY]
         if date_prop['type'] == 'date' and date_prop['date']:
             start_date = date_prop['date']['start']
             end_date = date_prop['date'].get('end')
             return start_date, end_date
-    
+
     return None, None
 
 
 def extract_notion_title(notion_item):
     """Extract full title from a Notion item, concatenating all title segments"""
     properties = notion_item.get('properties', {})
-    
+
     if NOTION_TITLE_PROPERTY in properties:
         title_prop = properties[NOTION_TITLE_PROPERTY]
         if title_prop['type'] == 'title' and title_prop['title']:
-            # Concatenate all title segments (Notion titles can have multiple rich text objects)
             title_parts = [segment.get('plain_text', '') for segment in title_prop['title']]
             return ''.join(title_parts)
-    
+
     return "Untitled Event"
 
 
@@ -259,10 +296,8 @@ def notion_to_calendar_event(notion_item):
     """Convert a Notion item to a Google Calendar event"""
     properties = notion_item.get('properties', {})
 
-    # Extract title (concatenating all segments)
     title = extract_notion_title(notion_item)
 
-    # Extract date(s)
     start_time = None
     end_time = None
     is_all_day = False
@@ -273,23 +308,18 @@ def notion_to_calendar_event(notion_item):
             start_time = date_prop['date']['start']
             end_time = date_prop['date'].get('end')
 
-            # Case: all-day (format = YYYY-MM-DD)
             if len(start_time) == 10:
                 is_all_day = True
                 if not end_time:
-                    # if no end date → set end = start + 1 day
                     end_date = datetime.strptime(start_time, "%Y-%m-%d") + timedelta(days=1)
                     end_time = end_date.strftime("%Y-%m-%d")
                 else:
-                    # Notion end dates are inclusive, Google Calendar end dates are exclusive
-                    # So we need to add 1 day to the Notion end date for Google Calendar
                     end_date = datetime.strptime(end_time, "%Y-%m-%d") + timedelta(days=1)
                     end_time = end_date.strftime("%Y-%m-%d")
 
     if not start_time:
         return None
 
-    # Build calendar event
     event = {
         'summary': title,
         'description': f"Synced from Notion: {notion_item['url']}",
@@ -299,16 +329,22 @@ def notion_to_calendar_event(notion_item):
         event['start'] = {'date': start_time}
         event['end'] = {'date': end_time}
     else:
-        # Case: has time
         if not end_time:
-            # If only a start time exists, set end = start (0-duration event)
-            # This preserves the "start time only" behavior from Notion
             end_time = start_time
-
         event['start'] = {'dateTime': start_time}
         event['end'] = {'dateTime': end_time}
 
     return event
+
+
+def _events_are_equivalent(new_event, existing_event):
+    """True if the calendar event already matches what Notion would set
+    (summary + start/end), so we can skip a needless update."""
+    if new_event.get('summary', '') != existing_event.get('summary', ''):
+        return False
+    new_start, new_end = gcal_event_to_notion_date(new_event)
+    ex_start, ex_end = gcal_event_to_notion_date(existing_event)
+    return date_values_equal(new_start, ex_start) and date_values_equal(new_end, ex_end)
 
 
 def sync_notion_to_calendar(service, notion_items, notion_ids):
@@ -320,7 +356,6 @@ def sync_notion_to_calendar(service, notion_items, notion_ids):
     skipped_count = 0
     deleted_count = 0
 
-    # --- CREATE or UPDATE ---
     for item in notion_items:
         try:
             event = notion_to_calendar_event(item)
@@ -330,30 +365,28 @@ def sync_notion_to_calendar(service, notion_items, notion_ids):
                 continue
 
             notion_id = item['id']
-            # Always attach the Notion ID
             event['extendedProperties'] = {'private': {'notion_id': notion_id}}
 
-            # Look for existing event
             existing = service.events().list(
                 calendarId=CALENDAR_ID,
                 privateExtendedProperty=f"notion_id={notion_id}"
             ).execute().get('items', [])
 
             if existing:
-                # Update only if Notion is newer than the existing calendar event
                 existing_event = existing[0]
                 existing_event_id = existing_event['id']
+
+                # Skip if the calendar already matches Notion (prevents churn)
+                if _events_are_equivalent(event, existing_event):
+                    continue
 
                 notion_last_edited = parse_iso_datetime(item.get('last_edited_time'))
                 gcal_last_updated = parse_iso_datetime(existing_event.get('updated'))
 
                 if notion_last_edited and gcal_last_updated and notion_last_edited <= gcal_last_updated:
-                    # Calendar is newer or same; skip overwriting it from an older Notion value
                     print(
                         "⏭️ Skipping Notion → Calendar update "
-                        f"(calendar newer or same) for: {event['summary']} "
-                        f"(Notion last_edited={notion_last_edited}, "
-                        f"Calendar updated={gcal_last_updated})"
+                        f"(calendar newer or same) for: {event['summary']}"
                     )
                     continue
 
@@ -365,7 +398,6 @@ def sync_notion_to_calendar(service, notion_items, notion_ids):
                 print(f"🔄 Updated calendar event: {event['summary']}")
                 updated_count += 1
             else:
-                # Create
                 service.events().insert(
                     calendarId=CALENDAR_ID,
                     body=event
@@ -381,13 +413,11 @@ def sync_notion_to_calendar(service, notion_items, notion_ids):
     try:
         print("🔍 Checking for calendar events to delete...")
 
-        # Get all events from the calendar (we'll filter manually)
         gcal_events = service.events().list(
             calendarId=CALENDAR_ID,
             maxResults=2500
         ).execute().get('items', [])
 
-        # Filter for events that have our notion_id extended property
         synced_events = []
         for event in gcal_events:
             extended_props = event.get('extendedProperties', {}).get('private', {})
@@ -396,7 +426,6 @@ def sync_notion_to_calendar(service, notion_items, notion_ids):
 
         print(f"🔍 Found {len(synced_events)} previously synced events")
 
-        # Delete events whose notion_id is no longer in our Notion DB
         for g_event in synced_events:
             notion_id = g_event['extendedProperties']['private']['notion_id']
             if notion_id not in notion_ids:
@@ -421,31 +450,31 @@ def sync_calendar_to_notion(service, notion_items):
     updated_count = 0
     deleted_count = 0
 
-    # Build a map of notion_id → notion_item for quick lookup
     notion_map = {item['id']: item for item in notion_items}
 
     try:
-        # Get all calendar events
         gcal_events = service.events().list(
             calendarId=CALENDAR_ID,
             maxResults=2500
         ).execute().get('items', [])
 
-        # Process events that were synced from Notion (have notion_id)
         for gcal_event in gcal_events:
             extended_props = gcal_event.get('extendedProperties', {}).get('private', {})
             notion_id = extended_props.get('notion_id')
 
             if not notion_id:
-                # This is a new event created directly in Google Calendar
-                # Create a new Notion page for it
-                title = gcal_event.get('summary', 'Untitled Event')
+                # New event created directly in Google Calendar.
+                title = gcal_event.get('summary', '')
                 start_date, end_date = gcal_event_to_notion_date(gcal_event)
+
+                # GUARD: don't turn blank / 'Untitled Event' junk into Notion tasks.
+                if title_is_blank(title):
+                    print("⏭️ Skipping blank/untitled calendar event (not creating a Notion task)")
+                    continue
 
                 if start_date:
                     new_notion_id = create_notion_page(title, start_date, end_date)
                     if new_notion_id:
-                        # Update the calendar event to include the notion_id
                         gcal_event['extendedProperties'] = {
                             'private': {'notion_id': new_notion_id}
                         }
@@ -458,10 +487,8 @@ def sync_calendar_to_notion(service, notion_items):
                         created_count += 1
                 continue
 
-            # Check if the corresponding Notion page still exists
+            # If the Notion page is gone, remove the orphaned calendar event.
             if notion_id not in notion_map:
-                # Notion page was deleted, but calendar event still exists
-                # Delete the calendar event
                 service.events().delete(
                     calendarId=CALENDAR_ID,
                     eventId=gcal_event['id']
@@ -469,63 +496,44 @@ def sync_calendar_to_notion(service, notion_items):
                 print(f"🗑️ Deleted calendar event (Notion page gone): {gcal_event.get('summary')}")
                 continue
 
-            # Compare calendar event with Notion page and update if needed
             notion_item = notion_map[notion_id]
 
-            # Decide direction using last-edited timestamps:
-            # - Notion uses page['last_edited_time']
-            # - Google Calendar uses event['updated']
             notion_last_edited = parse_iso_datetime(notion_item.get('last_edited_time'))
             gcal_last_updated = parse_iso_datetime(gcal_event.get('updated'))
 
-            # If Notion is newer or same, do NOT overwrite it from Calendar
+            # If Notion is newer or same, do NOT overwrite it from Calendar.
             if notion_last_edited and gcal_last_updated and notion_last_edited >= gcal_last_updated:
-                # Let the later Notion change win; skip Calendar → Notion for this item
-                print(
-                    "⏭️ Skipping Calendar → Notion update "
-                    f"(Notion newer or same) for: {gcal_event.get('summary', 'Untitled Event')} "
-                    f"(Notion last_edited={notion_last_edited}, "
-                    f"Calendar updated={gcal_last_updated})"
-                )
                 continue
 
-            # Get current values from Notion
             notion_title = extract_notion_title(notion_item)
-
             notion_start, notion_end = notion_item_to_date(notion_item)
 
-            # Get calendar event values
-            gcal_title = gcal_event.get('summary', 'Untitled Event')
+            gcal_title = gcal_event.get('summary', '')
             gcal_start, gcal_end = gcal_event_to_notion_date(gcal_event)
 
-            # Check if we need to update Notion (compare both title and dates)
-            needs_update = False
             changes = []
 
-            # Compare title
-            if gcal_title != notion_title:
-                needs_update = True
+            # TITLE: only a real, non-blank, genuinely different title counts.
+            title_changed = (not title_is_blank(gcal_title)) and (gcal_title != notion_title)
+            if title_changed:
                 changes.append(f"title: '{notion_title}' → '{gcal_title}'")
 
-            # Compare start date - normalize None to empty string for comparison
-            notion_start_normalized = notion_start or ""
-            gcal_start_normalized = gcal_start or ""
-            if gcal_start_normalized != notion_start_normalized:
-                needs_update = True
-                changes.append(f"start date: '{notion_start or '(none)'}' → '{gcal_start or '(none)'}'")
+            # DATES: compare as instants to avoid fake changes.
+            start_changed = not date_values_equal(gcal_start, notion_start)
+            if start_changed:
+                changes.append(f"start: '{notion_start or '(none)'}' → '{gcal_start or '(none)'}'")
 
-            # Compare end date - normalize None to empty string for comparison
-            notion_end_normalized = notion_end or ""
-            gcal_end_normalized = gcal_end or ""
-            if gcal_end_normalized != notion_end_normalized:
-                needs_update = True
-                changes.append(f"end date: '{notion_end or '(none)'}' → '{gcal_end or '(none)'}'")
+            end_changed = not date_values_equal(gcal_end, notion_end)
+            if end_changed:
+                changes.append(f"end: '{notion_end or '(none)'}' → '{gcal_end or '(none)'}'")
 
-            if needs_update and gcal_start:
-                change_desc = ", ".join(changes)
-                print(f"📝 Changes detected: {change_desc}")
-                if update_notion_page(notion_id, gcal_title, gcal_start, gcal_end):
-                    print(f"🔄 Updated Notion page: {gcal_title}")
+            if changes and gcal_start:
+                print(f"📝 Changes detected: {', '.join(changes)}")
+                # Pass the title ONLY if it really changed; otherwise None so the
+                # existing Notion title is preserved (update_notion_page also guards).
+                title_to_write = gcal_title if title_changed else None
+                if update_notion_page(notion_id, title_to_write, gcal_start, gcal_end):
+                    print(f"🔄 Updated Notion page: {gcal_title if title_changed else notion_title}")
                     updated_count += 1
 
     except Exception as e:
@@ -539,7 +547,6 @@ def main():
     print("🔄 Starting 2-Way Notion ↔ Google Calendar sync...")
     print(f"📝 Using property names: Title='{NOTION_TITLE_PROPERTY}', Date='{NOTION_DATE_PROPERTY}'")
 
-    # Validate configuration early to fail fast with clear error
     validate_env()
 
     try:
@@ -548,22 +555,19 @@ def main():
     except Exception as e:
         print(f"❌ Failed to connect to Google Calendar: {e}")
         return
-    
-    # First, sync changes from Google Calendar → Notion so that
-    # manual edits in Google Calendar win over older Notion values.
+
+    # Calendar → Notion first, so real manual calendar edits win over older Notion values.
     notion_items = get_notion_items()
     print(f"📋 Found {len(notion_items)} Notion items")
     c2n_created, c2n_updated, c2n_deleted = sync_calendar_to_notion(
         service, notion_items
     )
 
-    # Re-fetch Notion after Calendar → Notion sync so we use the
-    # latest values (including any updates that came from Calendar)
+    # Re-fetch so Notion → Calendar uses the latest values.
     notion_items = get_notion_items()
     print(f"📋 Found {len(notion_items)} Notion items after Calendar → Notion sync")
     notion_ids = set(item['id'] for item in notion_items)
 
-    # Then sync Notion → Google Calendar using the refreshed data
     n2c_created, n2c_updated, n2c_skipped, n2c_deleted = sync_notion_to_calendar(
         service, notion_items, notion_ids
     )
