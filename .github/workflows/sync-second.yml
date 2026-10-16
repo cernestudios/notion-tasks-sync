@@ -2,12 +2,12 @@ name: Notion-Calendar Sync (Lessons)
 
 on:
   workflow_dispatch: {}
-  schedule:
-    # Runs once per day at 00:00 UTC
-    - cron: "0 0 * * *"
 
 jobs:
   sync-second:
+    # Intentionally disabled. Lessons has no configured second database/calendar.
+    # No scheduled trigger; even manual dispatch skips the sync job.
+    if: false
     runs-on: ubuntu-latest
     concurrency:
       # One run at a time; new runs queue instead of cancelling in-progress
